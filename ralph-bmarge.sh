@@ -218,6 +218,42 @@ get_epic_from_story() {
     echo "$1" | cut -d'-' -f1
 }
 
+# Find similar story key (handles renamed keys)
+# Input: "17-1-crewai-setup-on-modal"
+# Looks for keys starting with same epic-story prefix (e.g., "17-1-")
+find_similar_story_key() {
+    local story_key=$1
+    local prefix=$(echo "$story_key" | grep -oE '^[0-9]+-[0-9]+-')
+    [ -z "$prefix" ] && return
+
+    # Find any key with same prefix that has status done/review
+    local similar=$(grep -E "^[[:space:]]+${prefix}[^:]+:[[:space:]]*(done|review)" "$SPRINT_STATUS" 2>/dev/null | head -1)
+    [ -z "$similar" ] && return
+
+    extract_story_key "$similar"
+}
+
+# Check if a story key was renamed (original missing, similar exists with done status)
+detect_renamed_key() {
+    local original_key=$1
+    local expected_status=$2
+
+    # If original key exists, no rename detected
+    local current=$(get_story_status "$original_key")
+    [ -n "$current" ] && return 1
+
+    # Look for similar key with expected status
+    local similar_key=$(find_similar_story_key "$original_key")
+    [ -z "$similar_key" ] && return 1
+
+    local similar_status=$(get_story_status "$similar_key")
+    if [ "$similar_status" = "$expected_status" ] || [ "$similar_status" = "done" ]; then
+        echo "$similar_key"
+        return 0
+    fi
+    return 1
+}
+
 # Check if all stories in an epic are done
 is_epic_complete() {
     local epic_num=$1
@@ -616,23 +652,56 @@ run_workflow() {
                 echo -e "${MAGENTA}╚═══════════════════════════════════════════════════════════════╝${NC}"
                 echo ""
 
+                # Check for renamed key BEFORE calling FIXER
+                local renamed_key=$(detect_renamed_key "$story_key" "$expected_status")
+                if [ -n "$renamed_key" ]; then
+                    echo -e "${YELLOW}[AUTO-FIX] Detected renamed key: $story_key → $renamed_key${NC}"
+                    echo -e "${YELLOW}[AUTO-FIX] Adding alias to YAML...${NC}"
+
+                    # Add the original key as an alias pointing to done
+                    # Find the renamed key line and add alias after it
+                    local renamed_line_num=$(grep -n "^[[:space:]]*${renamed_key}:" "$SPRINT_STATUS" | head -1 | cut -d: -f1)
+                    if [ -n "$renamed_line_num" ]; then
+                        sed -i '' "${renamed_line_num}a\\
+  ${story_key}: ${expected_status}  # auto-alias for renamed key
+" "$SPRINT_STATUS"
+                        echo -e "${GREEN}[AUTO-FIX] Added alias: ${story_key}: ${expected_status}${NC}"
+
+                        # Verify fix worked
+                        local auto_fixed_status=$(get_story_status "$story_key")
+                        if [ "$auto_fixed_status" = "$expected_status" ]; then
+                            echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
+                            echo -e "${GREEN}║  ✅ AUTO-FIX SUCCEEDED - Key rename detected and fixed!       ║${NC}"
+                            echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+                            send_webhook "🔧 AUTO-FIXED: $story_key - Renamed key detected ($renamed_key), alias added" "Ralph-BMAD"
+                            stale_count=0
+                            last_status="$auto_fixed_status"
+                            continue
+                        fi
+                    fi
+                fi
+
                 # Build fixer prompt with full context
                 local fixer_prompt="URGENT: Story '$story_key' is STUCK in an infinite loop.
 
 SITUATION:
 - Sprint status file: $SPRINT_STATUS
 - Story file: $story_file
-- Current YAML status: $new_status
+- Current YAML status: '$new_status' (empty means key not found!)
 - Expected status: $expected_status
-- The previous Claude session reported the work as complete, but the YAML file was NOT updated.
+- The previous Claude session reported the work as complete, but the YAML file was NOT updated correctly.
+
+CRITICAL: If '$new_status' is EMPTY, the key '$story_key' may have been RENAMED during the workflow!
+Check if a similar key exists (same epic-story prefix like '$(echo $story_key | grep -oE "^[0-9]+-[0-9]+-")') with status 'done'.
 
 YOUR MISSION (Fixer Agent):
-1. Read the story file to verify if implementation work is actually complete
-2. Read sprint-status.yaml to see current state
-3. If the work appears complete, UPDATE sprint-status.yaml to set '$story_key: $expected_status'
-4. If work is NOT complete, explain what's missing
+1. Read sprint-status.yaml and look for the EXACT key '$story_key'
+2. If key is MISSING: search for similar keys with same prefix, then ADD the missing key: '$story_key: $expected_status'
+3. If key EXISTS but wrong status: UPDATE it to '$expected_status'
+4. Use the Edit tool to modify the YAML file
 
-IMPORTANT: You MUST update the YAML file if the work is done. Use the Edit tool to change the status.
+IMPORTANT: The script checks for EXACTLY '$story_key' - you MUST ensure this exact key exists with status '$expected_status'.
+Do NOT just report that a similar key exists - you must ADD or FIX the exact key!
 Do NOT ask questions - act autonomously to fix this stuck state."
 
                 echo -e "${MAGENTA}>>> FIXER Agent starting...${NC}"
@@ -667,6 +736,33 @@ Do NOT ask questions - act autonomously to fix this stuck state."
                     last_status="$fixed_status"
                     # Continue the main loop - don't return, let it proceed naturally
                 else
+                    # LAST RESORT: Try brute-force auto-fix for renamed keys
+                    echo -e "${YELLOW}[LAST-RESORT] FIXER failed, attempting brute-force fix...${NC}"
+
+                    local fallback_renamed=$(find_similar_story_key "$story_key")
+                    if [ -n "$fallback_renamed" ]; then
+                        local fallback_status=$(get_story_status "$fallback_renamed")
+                        echo -e "${YELLOW}[LAST-RESORT] Found similar key: $fallback_renamed ($fallback_status)${NC}"
+
+                        if [ "$fallback_status" = "$expected_status" ] || [ "$fallback_status" = "done" ]; then
+                            # Brute force: append the missing key to the YAML
+                            echo "  ${story_key}: ${fallback_status}  # auto-alias (last-resort fix)" >> "$SPRINT_STATUS"
+                            echo -e "${GREEN}[LAST-RESORT] Appended: ${story_key}: ${fallback_status}${NC}"
+
+                            # Verify
+                            local final_check=$(get_story_status "$story_key")
+                            if [ "$final_check" = "$expected_status" ] || [ "$final_check" = "done" ]; then
+                                echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
+                                echo -e "${GREEN}║  ✅ LAST-RESORT FIX SUCCEEDED - Key alias added!              ║${NC}"
+                                echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════╝${NC}"
+                                send_webhook "🔧 LAST-RESORT FIX: $story_key - Added alias for renamed key $fallback_renamed" "Ralph-BMAD"
+                                stale_count=0
+                                last_status="$final_check"
+                                continue
+                            fi
+                        fi
+                    fi
+
                     echo -e "${RED}╔═══════════════════════════════════════════════════════════════╗${NC}"
                     echo -e "${RED}║  ❌ FIXER Agent FAILED - Manual intervention required         ║${NC}"
                     echo -e "${RED}╠═══════════════════════════════════════════════════════════════╣${NC}"

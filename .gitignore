@@ -1,0 +1,15 @@
+# Runtime files (project-specific)
+progress.txt
+archive/
+sprint-report-*.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

@@ -44,6 +44,15 @@ Ralph-bmarge automates the boring parts of BMAD sprints so you can focus on the 
 | **Sound notifications** | Optional sound alert when sprint completes (macOS/Linux) |
 | **Two-condition safety** | Only proceeds when BOTH: Claude has stopped AND status has changed |
 
+## Compatibility
+
+| Requirement | Status |
+|-------------|--------|
+| **Claude Code CLI** | Required (only supported CLI for now) |
+| **macOS** | Tested |
+| **Linux** | Should work (untested) |
+| **Windows** | Not supported |
+
 ## Prerequisites
 
 ### 1. BMAD Method (Required)

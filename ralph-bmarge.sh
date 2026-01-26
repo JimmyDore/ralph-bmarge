@@ -26,6 +26,29 @@ NOTIFY_SOUND=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# Load .env file if it exists (PROJECT_ROOT/.env or SCRIPT_DIR/.env)
+load_env() {
+    local env_file=""
+    if [ -f "$PROJECT_ROOT/.env" ]; then
+        env_file="$PROJECT_ROOT/.env"
+    elif [ -f "$SCRIPT_DIR/.env" ]; then
+        env_file="$SCRIPT_DIR/.env"
+    fi
+
+    if [ -n "$env_file" ]; then
+        while IFS='=' read -r key value; do
+            [[ "$key" =~ ^#.*$ ]] && continue
+            [[ -z "$key" ]] && continue
+            value=$(echo "$value" | sed 's/^["'"'"']//;s/["'"'"']$//')
+            export "$key=$value"
+        done < "$env_file"
+    fi
+}
+load_env
+
+# Set webhook from env if not already set via CLI
+[ -z "$WEBHOOK_URL" ] && WEBHOOK_URL="${SLACK_WEBHOOK_URL:-${DISCORD_WEBHOOK_URL:-}}"
+
 # Stats tracking
 TOTAL_COST=0
 TOTAL_TIME=0
@@ -137,9 +160,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# BMAD paths
-SPRINT_STATUS="$PROJECT_ROOT/_bmad-output/implementation-artifacts/sprint-status.yaml"
-STORIES_DIR="$PROJECT_ROOT/_bmad-output/implementation-artifacts"
+# BMAD paths (customizable - default matches bmad/bmm/config.yaml)
+# Override with: BMAD_ARTIFACTS_DIR=/custom/path ./ralph-bmarge.sh
+ARTIFACTS_DIR="${BMAD_ARTIFACTS_DIR:-$PROJECT_ROOT/docs/implementation-artifacts}"
+SPRINT_STATUS="$ARTIFACTS_DIR/sprint-status.yaml"
+STORIES_DIR="$ARTIFACTS_DIR"
 PROGRESS_FILE="$SCRIPT_DIR/progress.txt"
 ARCHIVE_DIR="$SCRIPT_DIR/archive"
 
@@ -965,6 +990,25 @@ while [ "$INFINITE_MODE" = true ] || [ $ITERATION -lt $MAX_ITERATIONS ]; do
     if [ "$STORY_STATUS" = "review" ]; then
         run_workflow "$NEXT_STORY" "code-review" "done"
         STORY_COST=$(echo "$STORY_COST + $LAST_RUN_COST" | bc 2>/dev/null || echo "$LAST_RUN_COST")
+    fi
+
+    # Phase 3: commit (after successful code-review)
+    STORY_STATUS=$(get_story_status "$NEXT_STORY")
+    if [ "$STORY_STATUS" = "done" ]; then
+        echo -e "${CYAN}┌─────────────────────────────────────────┐${NC}"
+        echo -e "${CYAN}│  commit: $NEXT_STORY${NC}"
+        echo -e "${CYAN}└─────────────────────────────────────────┘${NC}"
+
+        if [ "$DRY_RUN" = true ]; then
+            echo -e "${YELLOW}[DRY-RUN] Would commit changes for $NEXT_STORY${NC}"
+        else
+            # Run commit skill
+            COMMIT_SESSION=$(new_session_id)
+            COMMIT_PROMPT="Run /commit for story $NEXT_STORY. Stage all changes and commit with message: feat($NEXT_STORY): complete story implementation. Work autonomously, do not ask questions."
+            run_claude_expect "$COMMIT_PROMPT" "$COMMIT_SESSION" ""
+            STORY_COST=$(echo "$STORY_COST + $LAST_RUN_COST" | bc 2>/dev/null || echo "$LAST_RUN_COST")
+            echo -e "${GREEN}>>> Committed changes for $NEXT_STORY${NC}"
+        fi
     fi
 
     # Calculate story duration and track stats

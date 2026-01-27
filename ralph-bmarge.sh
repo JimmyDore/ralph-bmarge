@@ -1257,8 +1257,8 @@ while [ "$INFINITE_MODE" = true ] || [ $ITERATION -lt $MAX_ITERATIONS ]; do
         send_webhook "✅ Story completed: $NEXT_STORY ($(format_duration $STORY_DURATION), \$$(printf "%.2f" ${STORY_COST:-0}))" "Story Done"
     fi
 
-    # Check if all done
-    if [ "$(count_remaining)" -eq 0 ]; then
+    # Check if all done (both remaining AND backlog must be empty)
+    if [ "$(count_remaining)" -eq 0 ] && [ "$(count_backlog)" -eq 0 ]; then
         echo ""
         echo -e "${GREEN}╔═══════════════════════════════════════════════════════════════╗${NC}"
         echo -e "${GREEN}║              ALL STORIES COMPLETE!                            ║${NC}"

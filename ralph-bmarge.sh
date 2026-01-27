@@ -11,7 +11,7 @@
 set -e
 
 # Cleanup temp files on exit
-trap 'rm -f /tmp/ralph-prompt.* 2>/dev/null' EXIT
+trap 'rm -f /tmp/ralph-prompt.* /tmp/ralph-stats.* /tmp/ralph-output.* /tmp/ralph-fixer.* 2>/dev/null' EXIT
 
 # Configuration
 DRY_RUN=false
@@ -21,6 +21,8 @@ INFINITE_MODE=true
 MAX_ITERATIONS=0
 MAX_CONTINUES=0
 MAX_STALE_CONTINUES=10  # Safety: abort if status unchanged after N continues
+RATE_LIMIT_WAIT=600     # Wait time in seconds when rate limited (default: 10 min)
+MAX_RATE_LIMIT_RETRIES=5  # Max retries on rate limit before giving up
 WEBHOOK_URL=""
 NOTIFY_SOUND=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,6 +86,10 @@ while [[ $# -gt 0 ]]; do
             MAX_STALE_CONTINUES="$2"
             shift 2
             ;;
+        --rate-limit-wait)
+            RATE_LIMIT_WAIT="$2"
+            shift 2
+            ;;
         --webhook)
             WEBHOOK_URL="$2"
             shift 2
@@ -105,7 +111,7 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "═══════════════════════════════════════════════════════════════"
 
-            echo "Say hello" | claude --dangerously-skip-permissions --print --output-format stream-json --verbose 2>&1 | while IFS= read -r line; do
+            echo "Say hello" | IS_SANDBOX=1 claude --dangerously-skip-permissions --print --output-format stream-json --verbose 2>&1 | while IFS= read -r line; do
                 msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
                 case "$msg_type" in
                     "system")
@@ -137,6 +143,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --max-iterations N     Limit to N story iterations (default: infinite)"
             echo "  --max-continues N      Limit resume attempts per workflow (default: infinite)"
             echo "  --max-stale N          Abort if status unchanged after N continues (default: 10)"
+            echo "  --rate-limit-wait N    Seconds to wait on rate limit (default: 600 = 10 min)"
             echo "  --webhook URL          Send notifications to Slack/Discord webhook"
             echo "  --notify-sound         Play sound when sprint completes (macOS)"
             echo "  --test-claude          Test Claude execution (diagnose prompt handling)"
@@ -236,6 +243,19 @@ get_next_story() {
 
 count_remaining() {
     grep -E "^[[:space:]]+[0-9]+-[0-9]+-[^:]+:[[:space:]]*(ready-for-dev|in-progress|review)" "$SPRINT_STATUS" 2>/dev/null | wc -l | tr -d ' '
+}
+
+# Get next story in backlog (for auto-creation)
+get_next_backlog_story() {
+    local line
+    line=$(grep -E "^[[:space:]]+[0-9]+-[0-9]+-[^:]+:[[:space:]]*(backlog|\"backlog\")" "$SPRINT_STATUS" 2>/dev/null | head -1)
+    [ -z "$line" ] && return
+    extract_story_key "$line"
+}
+
+# Count stories in backlog
+count_backlog() {
+    grep -E "^[[:space:]]+[0-9]+-[0-9]+-[^:]+:[[:space:]]*(backlog|\"backlog\")" "$SPRINT_STATUS" 2>/dev/null | wc -l | tr -d ' '
 }
 
 # Extract epic number from story key (e.g., "3-2-feature" -> "3")
@@ -461,6 +481,45 @@ print_stats_summary() {
 # Global vars for capturing stats from subshell
 LAST_RUN_COST=0
 LAST_RUN_DURATION=0
+LAST_RUN_RATE_LIMITED=false
+
+# Check if output indicates rate limiting
+is_rate_limited() {
+    local output="$1"
+    local exit_code="$2"
+
+    # If exit code is 0 and we see success in output, NOT rate limited
+    if [ "$exit_code" -eq 0 ] && echo "$output" | grep -q '"subtype":"success"'; then
+        return 1
+    fi
+
+    # Check for specific rate limit error patterns (more strict matching)
+    # - "rate limit" as phrase (not just "rate" anywhere)
+    # - "429" with error context
+    # - "overloaded" as API error
+    if echo "$output" | grep -qiE "rate[ _-]?limit|error.*429|429.*error|too many requests|quota exceeded|overloaded_error|capacity"; then
+        return 0
+    fi
+
+    # Exit code non-zero with API error indicators
+    if [ "$exit_code" -ne 0 ] && echo "$output" | grep -qiE "api.*(error|failed)|error.*api|request failed"; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Format seconds into human-readable wait time
+format_wait_time() {
+    local seconds=$1
+    local mins=$((seconds / 60))
+    local secs=$((seconds % 60))
+    if [ $mins -gt 0 ]; then
+        echo "${mins}m ${secs}s"
+    else
+        echo "${secs}s"
+    fi
+}
 
 run_claude_expect() {
     local prompt="$1"
@@ -473,8 +532,10 @@ run_claude_expect() {
     # Create temp file for prompt (like original Ralph uses CLAUDE.md)
     local prompt_file=$(mktemp /tmp/ralph-prompt.XXXXXX)
     local stats_file=$(mktemp /tmp/ralph-stats.XXXXXX)
+    local output_file=$(mktemp /tmp/ralph-output.XXXXXX)
     echo "$prompt" > "$prompt_file"
     echo "0|0" > "$stats_file"
+    LAST_RUN_RATE_LIMITED=false
 
     echo -e "${YELLOW}[TRACE] Temp file created: $prompt_file${NC}"
     echo -e "${YELLOW}[TRACE] File size: $(wc -c < "$prompt_file") bytes${NC}"
@@ -508,7 +569,7 @@ run_claude_expect() {
     echo -e "${YELLOW}[TRACE] Session arg: $session_arg${NC}"
 
     if [ "$DEBUG_MODE" = true ]; then
-        echo -e "${CYAN}[DEBUG] Command: claude --dangerously-skip-permissions --print $session_arg < $prompt_file${NC}"
+        echo -e "${CYAN}[DEBUG] Command: IS_SANDBOX=1 claude --dangerously-skip-permissions --print $session_arg < $prompt_file${NC}"
         echo -e "${CYAN}[DEBUG] ═══ CLAUDE OUTPUT START ═══${NC}"
     fi
 
@@ -516,7 +577,7 @@ run_claude_expect() {
     echo -e "${YELLOW}[TRACE] >>> $(date)${NC}"
 
     # Build the full command for logging
-    local full_cmd="claude --dangerously-skip-permissions --print $session_arg"
+    local full_cmd="IS_SANDBOX=1 claude --dangerously-skip-permissions --print $session_arg"
     echo -e "${YELLOW}[TRACE] Full command: $full_cmd < $prompt_file${NC}"
     echo -e "${YELLOW}[TRACE] Prompt content preview: ${prompt:0:100}...${NC}"
 
@@ -527,7 +588,8 @@ run_claude_expect() {
 
     # Run Claude with streaming JSON output, parse and display in real-time
     # --output-format stream-json --verbose gives us line-by-line JSON we can parse
-    claude --dangerously-skip-permissions --print --output-format stream-json --verbose $session_arg < "$prompt_file" 2>&1 | while IFS= read -r line; do
+    # Also capture raw output for rate limit detection
+    IS_SANDBOX=1 claude --dangerously-skip-permissions --print --output-format stream-json --verbose $session_arg < "$prompt_file" 2>&1 | tee "$output_file" | while IFS= read -r line; do
         # Try to extract and display assistant messages
         local msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
 
@@ -564,7 +626,7 @@ run_claude_expect() {
                 ;;
         esac
     done || true
-    exit_code=$?
+    exit_code=${PIPESTATUS[0]}
 
     echo -e "${YELLOW}[TRACE] Stream finished (exit: $exit_code)${NC}"
 
@@ -593,10 +655,123 @@ run_claude_expect() {
 
     echo -e "${GREEN}>>> Claude terminé (exit: $exit_code, ${duration}s, \$${LAST_RUN_COST})${NC}"
 
+    # Check for rate limiting in output
+    if [ -f "$output_file" ]; then
+        local output_content=$(cat "$output_file")
+        if is_rate_limited "$output_content" "$exit_code"; then
+            LAST_RUN_RATE_LIMITED=true
+            echo -e "${RED}>>> Rate limit detected in Claude response${NC}"
+        fi
+    fi
+
     # Cleanup
-    rm -f "$prompt_file" "$stats_file"
+    rm -f "$prompt_file" "$stats_file" "$output_file"
 
     return $exit_code
+}
+
+# Wrapper that handles rate limit retries
+run_claude_with_retry() {
+    local prompt="$1"
+    local session_id="$2"
+    local is_resume="$3"
+    local retry_count=0
+
+    while [ $retry_count -lt $MAX_RATE_LIMIT_RETRIES ]; do
+        run_claude_expect "$prompt" "$session_id" "$is_resume"
+        local result=$?
+
+        if [ "$LAST_RUN_RATE_LIMITED" = true ]; then
+            retry_count=$((retry_count + 1))
+            if [ $retry_count -lt $MAX_RATE_LIMIT_RETRIES ]; then
+                echo ""
+                echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════════╗${NC}"
+                echo -e "${YELLOW}║  ⏳ RATE LIMITED - Waiting before retry                       ║${NC}"
+                echo -e "${YELLOW}╠═══════════════════════════════════════════════════════════════╣${NC}"
+                echo -e "${YELLOW}║  Retry: $retry_count / $MAX_RATE_LIMIT_RETRIES${NC}"
+                echo -e "${YELLOW}║  Wait time: $(format_wait_time $RATE_LIMIT_WAIT)${NC}"
+                echo -e "${YELLOW}║  Will resume at: $(date -d "+${RATE_LIMIT_WAIT} seconds" 2>/dev/null || date -v+${RATE_LIMIT_WAIT}S 2>/dev/null || echo "in ${RATE_LIMIT_WAIT}s")${NC}"
+                echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════════╝${NC}"
+                echo ""
+
+                # Send webhook notification
+                send_webhook "⏳ Rate limited on session $session_id. Waiting $(format_wait_time $RATE_LIMIT_WAIT) before retry ($retry_count/$MAX_RATE_LIMIT_RETRIES)" "Rate Limit"
+
+                # Wait with countdown (show progress every minute for long waits)
+                local remaining=$RATE_LIMIT_WAIT
+                while [ $remaining -gt 0 ]; do
+                    if [ $remaining -gt 60 ] && [ $((remaining % 60)) -eq 0 ]; then
+                        echo -e "${YELLOW}>>> $(format_wait_time $remaining) remaining...${NC}"
+                    fi
+                    sleep 1
+                    remaining=$((remaining - 1))
+                done
+
+                echo -e "${GREEN}>>> Resuming after rate limit wait...${NC}"
+            else
+                echo -e "${RED}╔═══════════════════════════════════════════════════════════════╗${NC}"
+                echo -e "${RED}║  ❌ MAX RATE LIMIT RETRIES EXCEEDED                           ║${NC}"
+                echo -e "${RED}╠═══════════════════════════════════════════════════════════════╣${NC}"
+                echo -e "${RED}║  Tried $MAX_RATE_LIMIT_RETRIES times, still rate limited.${NC}"
+                echo -e "${RED}║  Manual intervention required.                                ║${NC}"
+                echo -e "${RED}╚═══════════════════════════════════════════════════════════════╝${NC}"
+                send_webhook "🚨 Max rate limit retries ($MAX_RATE_LIMIT_RETRIES) exceeded on session $session_id. Manual intervention needed." "Rate Limit Alert"
+                return 1
+            fi
+        else
+            # No rate limit, return result
+            return $result
+        fi
+    done
+
+    return 1
+}
+
+# ═══════════════════════════════════════════════════════════════
+# WORKFLOW: Auto-create story from backlog
+# ═══════════════════════════════════════════════════════════════
+
+create_next_story() {
+    local backlog_story=$1
+    local session_id=$(new_session_id)
+
+    echo ""
+    echo -e "${MAGENTA}╔═══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${MAGENTA}║  📝 AUTO-CREATE STORY                                         ║${NC}"
+    echo -e "${MAGENTA}╠═══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${MAGENTA}║  Next backlog story: $backlog_story${NC}"
+    echo -e "${MAGENTA}║  Running /bmad_bmm_create-story...                            ║${NC}"
+    echo -e "${MAGENTA}╚═══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}[DRY-RUN] Would run /bmad_bmm_create-story for $backlog_story${NC}"
+        return 0
+    fi
+
+    local prompt="Execute /bmad_bmm_create-story to create the next story from backlog. The next story should be: $backlog_story. IMPORTANT: Work 100% autonomously - do NOT ask questions, do NOT wait for confirmation, make all decisions yourself. Create the story file and update sprint-status.yaml to mark it as ready-for-dev."
+
+    run_claude_with_retry "$prompt" "$session_id" ""
+    local result=$?
+
+    # Verify story was created
+    local new_status=$(get_story_status "$backlog_story")
+    if [ "$new_status" = "ready-for-dev" ]; then
+        echo -e "${GREEN}>>> Story $backlog_story created and ready for dev${NC}"
+        send_webhook "📝 Story created: $backlog_story (ready-for-dev)" "Story Created"
+        return 0
+    else
+        echo -e "${YELLOW}>>> Story creation may have renamed the key, checking...${NC}"
+        # The create-story workflow might have renamed the story key
+        # Check if any new ready-for-dev story appeared
+        local new_ready=$(get_next_story)
+        if [ -n "$new_ready" ]; then
+            echo -e "${GREEN}>>> Found ready story: $new_ready${NC}"
+            return 0
+        fi
+        echo -e "${RED}>>> Story creation failed or status not updated${NC}"
+        return 1
+    fi
 }
 
 # ═══════════════════════════════════════════════════════════════
@@ -652,7 +827,7 @@ run_workflow() {
         fi
 
         echo -e "${BLUE}>>> ${is_resume:+RESUME }Launching Claude...${NC}"
-        run_claude_expect "$prompt" "$session_id" "$is_resume"
+        run_claude_with_retry "$prompt" "$session_id" "$is_resume"
 
         # Check status after Claude stops
         local new_status=$(get_story_status "$story_key")
@@ -741,7 +916,7 @@ Do NOT ask questions - act autonomously to fix this stuck state."
                     echo -e "${CYAN}[FIXER] Prompt: ${fixer_prompt:0:100}...${NC}"
                 fi
 
-                claude --dangerously-skip-permissions --print --session-id "$fixer_session" < "$fixer_temp" 2>&1 | while IFS= read -r line; do
+                IS_SANDBOX=1 claude --dangerously-skip-permissions --print --session-id "$fixer_session" < "$fixer_temp" 2>&1 | while IFS= read -r line; do
                     echo -e "${MAGENTA}[FIXER] $line${NC}"
                 done
 
@@ -839,24 +1014,36 @@ if [ "$VALIDATE_MODE" = true ]; then
     echo -e "${YELLOW}═══ Stories by Status ═══${NC}"
     echo ""
 
-    for status in "ready-for-dev" "in-progress" "review" "done"; do
+    for status in "ready-for-dev" "in-progress" "review" "backlog" "done"; do
         count=$(grep -E "^[[:space:]]+[0-9]+-[0-9]+-[^:]+:[[:space:]]*${status}" "$SPRINT_STATUS" 2>/dev/null | wc -l | tr -d ' ')
         if [ "$count" -gt 0 ]; then
             case $status in
                 ready-for-dev) color=$GREEN ;;
                 in-progress) color=$YELLOW ;;
                 review) color=$CYAN ;;
+                backlog) color=$MAGENTA ;;
                 done) color=$NC ;;
             esac
             echo -e "${color}[$status] ($count stories)${NC}"
-            grep -E "^[[:space:]]+[0-9]+-[0-9]+-[^:]+:[[:space:]]*${status}" "$SPRINT_STATUS" 2>/dev/null | while read line; do
-                story=$(extract_story_key "$line")
-                epic=$(get_epic_from_story "$story")
-                story_file="$STORIES_DIR/${story}.md"
-                file_exists="✓"
-                [ ! -f "$story_file" ] && file_exists="✗ (missing)"
-                echo "  - $story (Epic $epic) $file_exists"
-            done
+            # Only show first 5 for backlog to avoid clutter
+            if [ "$status" = "backlog" ] && [ "$count" -gt 5 ]; then
+                grep -E "^[[:space:]]+[0-9]+-[0-9]+-[^:]+:[[:space:]]*${status}" "$SPRINT_STATUS" 2>/dev/null | head -5 | while read line; do
+                    story=$(extract_story_key "$line")
+                    epic=$(get_epic_from_story "$story")
+                    echo "  - $story (Epic $epic) (will be created)"
+                done
+                remaining=$((count - 5))
+                echo "  ... and $remaining more in backlog"
+            else
+                grep -E "^[[:space:]]+[0-9]+-[0-9]+-[^:]+:[[:space:]]*${status}" "$SPRINT_STATUS" 2>/dev/null | while read line; do
+                    story=$(extract_story_key "$line")
+                    epic=$(get_epic_from_story "$story")
+                    story_file="$STORIES_DIR/${story}.md"
+                    file_exists="✓"
+                    [ ! -f "$story_file" ] && file_exists="✗ (missing)"
+                    echo "  - $story (Epic $epic) $file_exists"
+                done
+            fi
             echo ""
         fi
     done
@@ -877,7 +1064,15 @@ if [ "$VALIDATE_MODE" = true ]; then
             echo -e "${RED}File exists:${NC} ✗ MISSING"
         fi
     else
-        echo -e "${GREEN}No pending stories - all complete!${NC}"
+        # No ready story - check backlog
+        NEXT_BACKLOG=$(get_next_backlog_story)
+        if [ -n "$NEXT_BACKLOG" ]; then
+            echo -e "${MAGENTA}No ready stories - will AUTO-CREATE from backlog:${NC}"
+            echo -e "${MAGENTA}Next backlog:${NC} $NEXT_BACKLOG"
+            echo -e "${MAGENTA}Action:${NC} Ralph will run /bmad_bmm_create-story automatically"
+        else
+            echo -e "${GREEN}All stories complete! (including backlog)${NC}"
+        fi
     fi
 
     echo ""
@@ -910,13 +1105,17 @@ if [ "$DRY_RUN" = true ]; then
 fi
 
 REMAINING=$(count_remaining)
-if [ "$REMAINING" -eq 0 ]; then
-    echo -e "${GREEN}All stories complete!${NC}"
+BACKLOG=$(count_backlog)
+
+if [ "$REMAINING" -eq 0 ] && [ "$BACKLOG" -eq 0 ]; then
+    echo -e "${GREEN}All stories complete! (no backlog remaining)${NC}"
     echo "<promise>COMPLETE</promise>"
     exit 0
 fi
 
-echo "Stories remaining: $REMAINING"
+echo "Stories ready/in-progress/review: $REMAINING"
+echo "Stories in backlog: $BACKLOG"
+echo "Auto-create: enabled (will create from backlog when needed)"
 if [ "$INFINITE_MODE" = true ]; then
     echo "Mode: infinite (until all stories complete)"
 else
@@ -946,10 +1145,37 @@ while [ "$INFINITE_MODE" = true ] || [ $ITERATION -lt $MAX_ITERATIONS ]; do
 
     NEXT_STORY=$(get_next_story)
 
+    # If no ready story, try to create one from backlog
     if [ -z "$NEXT_STORY" ]; then
-        echo -e "${GREEN}No more stories!${NC}"
-        echo "<promise>COMPLETE</promise>"
-        exit 0
+        BACKLOG_STORY=$(get_next_backlog_story)
+        if [ -n "$BACKLOG_STORY" ]; then
+            echo -e "${YELLOW}No ready stories, but backlog has: $BACKLOG_STORY${NC}"
+            create_next_story "$BACKLOG_STORY"
+
+            # Re-check for ready story after creation
+            NEXT_STORY=$(get_next_story)
+            if [ -z "$NEXT_STORY" ]; then
+                echo -e "${RED}Story creation did not produce a ready-for-dev story${NC}"
+                echo -e "${RED}Manual intervention may be required${NC}"
+                send_webhook "⚠️ Story creation failed for $BACKLOG_STORY - no ready-for-dev story found after create-story" "Creation Failed"
+                # Continue loop to try again or exit
+                sleep 5
+                continue
+            fi
+        else
+            echo -e "${GREEN}No more stories! (backlog empty)${NC}"
+            echo "<promise>COMPLETE</promise>"
+
+            # Print final stats and exit
+            print_stats_summary
+            if [ "$DRY_RUN" = false ]; then
+                REPORT_FILE=$(generate_sprint_report)
+                echo -e "${CYAN}Sprint report saved: $REPORT_FILE${NC}"
+            fi
+            send_webhook "🎉 Sprint complete! All stories done including backlog." "Sprint Complete"
+            play_notification_sound
+            exit 0
+        fi
     fi
 
     # Epic transition detection
@@ -1005,7 +1231,7 @@ while [ "$INFINITE_MODE" = true ] || [ $ITERATION -lt $MAX_ITERATIONS ]; do
             # Run commit skill
             COMMIT_SESSION=$(new_session_id)
             COMMIT_PROMPT="Run /commit for story $NEXT_STORY. Stage all changes and commit with message: feat($NEXT_STORY): complete story implementation. Work autonomously, do not ask questions."
-            run_claude_expect "$COMMIT_PROMPT" "$COMMIT_SESSION" ""
+            run_claude_with_retry "$COMMIT_PROMPT" "$COMMIT_SESSION" ""
             STORY_COST=$(echo "$STORY_COST + $LAST_RUN_COST" | bc 2>/dev/null || echo "$LAST_RUN_COST")
             echo -e "${GREEN}>>> Committed changes for $NEXT_STORY${NC}"
         fi

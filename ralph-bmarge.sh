@@ -22,7 +22,7 @@ MAX_ITERATIONS=0
 MAX_CONTINUES=0
 MAX_STALE_CONTINUES=10  # Safety: abort if status unchanged after N continues
 RATE_LIMIT_WAIT=600     # Wait time in seconds when rate limited (default: 10 min)
-MAX_RATE_LIMIT_RETRIES=5  # Max retries on rate limit before giving up
+MAX_RATE_LIMIT_RETRIES=0  # 0 = infinite retries on rate limit (never give up)
 WEBHOOK_URL=""
 NOTIFY_SOUND=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -90,6 +90,10 @@ while [[ $# -gt 0 ]]; do
             RATE_LIMIT_WAIT="$2"
             shift 2
             ;;
+        --max-rate-retries)
+            MAX_RATE_LIMIT_RETRIES="$2"
+            shift 2
+            ;;
         --webhook)
             WEBHOOK_URL="$2"
             shift 2
@@ -144,6 +148,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --max-continues N      Limit resume attempts per workflow (default: infinite)"
             echo "  --max-stale N          Abort if status unchanged after N continues (default: 10)"
             echo "  --rate-limit-wait N    Seconds to wait on rate limit (default: 600 = 10 min)"
+            echo "  --max-rate-retries N   Max rate limit retries (0 = infinite, default: 0)"
             echo "  --webhook URL          Send notifications to Slack/Discord webhook"
             echo "  --notify-sound         Play sound when sprint completes (macOS)"
             echo "  --test-claude          Test Claude execution (diagnose prompt handling)"
@@ -495,9 +500,10 @@ is_rate_limited() {
 
     # Check for specific rate limit error patterns (more strict matching)
     # - "rate limit" as phrase (not just "rate" anywhere)
+    # - "hit your limit" / "hit.* limit" - Claude's rate limit message
     # - "429" with error context
     # - "overloaded" as API error
-    if echo "$output" | grep -qiE "rate[ _-]?limit|error.*429|429.*error|too many requests|quota exceeded|overloaded_error|capacity"; then
+    if echo "$output" | grep -qiE "rate[ _-]?limit|hit.* limit|error.*429|429.*error|too many requests|quota exceeded|overloaded_error|capacity"; then
         return 0
     fi
 
@@ -677,38 +683,17 @@ run_claude_with_retry() {
     local is_resume="$3"
     local retry_count=0
 
-    while [ $retry_count -lt $MAX_RATE_LIMIT_RETRIES ]; do
-        run_claude_expect "$prompt" "$session_id" "$is_resume"
-        local result=$?
+    # MAX_RATE_LIMIT_RETRIES=0 means infinite retries
+    while [ $MAX_RATE_LIMIT_RETRIES -eq 0 ] || [ $retry_count -lt $MAX_RATE_LIMIT_RETRIES ]; do
+        # Use || true to prevent set -e from exiting on non-zero return
+        local result=0
+        run_claude_expect "$prompt" "$session_id" "$is_resume" || result=$?
 
         if [ "$LAST_RUN_RATE_LIMITED" = true ]; then
             retry_count=$((retry_count + 1))
-            if [ $retry_count -lt $MAX_RATE_LIMIT_RETRIES ]; then
-                echo ""
-                echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════════╗${NC}"
-                echo -e "${YELLOW}║  ⏳ RATE LIMITED - Waiting before retry                       ║${NC}"
-                echo -e "${YELLOW}╠═══════════════════════════════════════════════════════════════╣${NC}"
-                echo -e "${YELLOW}║  Retry: $retry_count / $MAX_RATE_LIMIT_RETRIES${NC}"
-                echo -e "${YELLOW}║  Wait time: $(format_wait_time $RATE_LIMIT_WAIT)${NC}"
-                echo -e "${YELLOW}║  Will resume at: $(date -d "+${RATE_LIMIT_WAIT} seconds" 2>/dev/null || date -v+${RATE_LIMIT_WAIT}S 2>/dev/null || echo "in ${RATE_LIMIT_WAIT}s")${NC}"
-                echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════════╝${NC}"
-                echo ""
 
-                # Send webhook notification
-                send_webhook "⏳ Rate limited on session $session_id. Waiting $(format_wait_time $RATE_LIMIT_WAIT) before retry ($retry_count/$MAX_RATE_LIMIT_RETRIES)" "Rate Limit"
-
-                # Wait with countdown (show progress every minute for long waits)
-                local remaining=$RATE_LIMIT_WAIT
-                while [ $remaining -gt 0 ]; do
-                    if [ $remaining -gt 60 ] && [ $((remaining % 60)) -eq 0 ]; then
-                        echo -e "${YELLOW}>>> $(format_wait_time $remaining) remaining...${NC}"
-                    fi
-                    sleep 1
-                    remaining=$((remaining - 1))
-                done
-
-                echo -e "${GREEN}>>> Resuming after rate limit wait...${NC}"
-            else
+            # Check if we should give up (only if MAX_RATE_LIMIT_RETRIES > 0)
+            if [ $MAX_RATE_LIMIT_RETRIES -gt 0 ] && [ $retry_count -ge $MAX_RATE_LIMIT_RETRIES ]; then
                 echo -e "${RED}╔═══════════════════════════════════════════════════════════════╗${NC}"
                 echo -e "${RED}║  ❌ MAX RATE LIMIT RETRIES EXCEEDED                           ║${NC}"
                 echo -e "${RED}╠═══════════════════════════════════════════════════════════════╣${NC}"
@@ -718,6 +703,36 @@ run_claude_with_retry() {
                 send_webhook "🚨 Max rate limit retries ($MAX_RATE_LIMIT_RETRIES) exceeded on session $session_id. Manual intervention needed." "Rate Limit Alert"
                 return 1
             fi
+
+            # Wait and retry
+            local retry_msg="$retry_count"
+            [ $MAX_RATE_LIMIT_RETRIES -eq 0 ] && retry_msg="$retry_count (infinite mode)"
+            [ $MAX_RATE_LIMIT_RETRIES -gt 0 ] && retry_msg="$retry_count / $MAX_RATE_LIMIT_RETRIES"
+
+            echo ""
+            echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${YELLOW}║  ⏳ RATE LIMITED - Waiting before retry                       ║${NC}"
+            echo -e "${YELLOW}╠═══════════════════════════════════════════════════════════════╣${NC}"
+            echo -e "${YELLOW}║  Retry: $retry_msg${NC}"
+            echo -e "${YELLOW}║  Wait time: $(format_wait_time $RATE_LIMIT_WAIT)${NC}"
+            echo -e "${YELLOW}║  Will resume at: $(date -d "+${RATE_LIMIT_WAIT} seconds" 2>/dev/null || date -v+${RATE_LIMIT_WAIT}S 2>/dev/null || echo "in ${RATE_LIMIT_WAIT}s")${NC}"
+            echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+
+            # Send webhook notification
+            send_webhook "⏳ Rate limited on session $session_id. Waiting $(format_wait_time $RATE_LIMIT_WAIT) before retry ($retry_msg)" "Rate Limit"
+
+            # Wait with countdown (show progress every minute for long waits)
+            local remaining=$RATE_LIMIT_WAIT
+            while [ $remaining -gt 0 ]; do
+                if [ $remaining -gt 60 ] && [ $((remaining % 60)) -eq 0 ]; then
+                    echo -e "${YELLOW}>>> $(format_wait_time $remaining) remaining...${NC}"
+                fi
+                sleep 1
+                remaining=$((remaining - 1))
+            done
+
+            echo -e "${GREEN}>>> Resuming after rate limit wait...${NC}"
         else
             # No rate limit, return result
             return $result

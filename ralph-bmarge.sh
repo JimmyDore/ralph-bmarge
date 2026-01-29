@@ -512,6 +512,14 @@ is_rate_limited() {
         return 0
     fi
 
+    # Quick exit with error and no output = likely still rate limited
+    # Claude exits immediately with code 1 when rate limited on retry
+    local output_size=$(echo "$output" | wc -c | tr -d ' ')
+    if [ "$exit_code" -ne 0 ] && [ "$output_size" -lt 500 ]; then
+        echo -e "${YELLOW}[RATE-LIMIT] Quick exit detected (exit=$exit_code, output=${output_size} bytes) - assuming still rate limited${NC}" >&2
+        return 0
+    fi
+
     return 1
 }
 

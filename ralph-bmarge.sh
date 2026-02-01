@@ -21,8 +21,8 @@ INFINITE_MODE=true
 MAX_ITERATIONS=0
 MAX_CONTINUES=0
 MAX_STALE_CONTINUES=10  # Safety: abort if status unchanged after N continues
-RATE_LIMIT_WAIT=600     # Wait time in seconds when rate limited (default: 10 min)
 MAX_RATE_LIMIT_RETRIES=0  # 0 = infinite retries on rate limit (never give up)
+RATE_LIMIT_PROBE_INTERVAL=120  # Probe every N seconds until rate limit lifted (default: 2 min)
 WEBHOOK_URL=""
 NOTIFY_SOUND=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -86,12 +86,12 @@ while [[ $# -gt 0 ]]; do
             MAX_STALE_CONTINUES="$2"
             shift 2
             ;;
-        --rate-limit-wait)
-            RATE_LIMIT_WAIT="$2"
-            shift 2
-            ;;
         --max-rate-retries)
             MAX_RATE_LIMIT_RETRIES="$2"
+            shift 2
+            ;;
+        --probe-interval)
+            RATE_LIMIT_PROBE_INTERVAL="$2"
             shift 2
             ;;
         --webhook)
@@ -147,8 +147,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --max-iterations N     Limit to N story iterations (default: infinite)"
             echo "  --max-continues N      Limit resume attempts per workflow (default: infinite)"
             echo "  --max-stale N          Abort if status unchanged after N continues (default: 10)"
-            echo "  --rate-limit-wait N    Seconds to wait on rate limit (default: 600 = 10 min)"
             echo "  --max-rate-retries N   Max rate limit retries (0 = infinite, default: 0)"
+            echo "  --probe-interval N     Probe every N seconds until rate limit lifted (default: 120 = 2 min)"
             echo "  --webhook URL          Send notifications to Slack/Discord webhook"
             echo "  --notify-sound         Play sound when sprint completes (macOS)"
             echo "  --test-claude          Test Claude execution (diagnose prompt handling)"
@@ -523,6 +523,53 @@ is_rate_limited() {
     return 1
 }
 
+# Probe to check if rate limit has been lifted
+# Makes a minimal Claude call and checks for success
+# Returns 0 if still rate limited, 1 if limit lifted
+probe_rate_limit() {
+    echo -e "${CYAN}[PROBE] Checking if rate limit has been lifted...${NC}" >&2
+
+    # Make minimal Claude call with short timeout
+    local probe_output
+    probe_output=$(IS_SANDBOX=1 timeout 30 claude --print --dangerously-skip-permissions "Reply with just: OK" 2>&1) || true
+    local probe_exit=$?
+
+    # Debug output
+    if [ "$DEBUG_MODE" = true ]; then
+        echo -e "${YELLOW}[PROBE DEBUG] Exit code: $probe_exit${NC}" >&2
+        echo -e "${YELLOW}[PROBE DEBUG] Output size: $(echo "$probe_output" | wc -c) bytes${NC}" >&2
+        echo -e "${YELLOW}[PROBE DEBUG] Output: ${probe_output:0:200}${NC}" >&2
+    fi
+
+    # Check if probe succeeded (got actual response)
+    if [ $probe_exit -eq 0 ] && echo "$probe_output" | grep -qi "OK"; then
+        echo -e "${GREEN}[PROBE] ✓ Rate limit lifted! Resuming immediately.${NC}" >&2
+        return 1  # Not rate limited anymore
+    fi
+
+    # Check for explicit rate limit indicators
+    if echo "$probe_output" | grep -qiE "rate[ _-]?limit|hit.* limit|429|quota exceeded|overloaded"; then
+        echo -e "${YELLOW}[PROBE] Still rate limited.${NC}" >&2
+        return 0
+    fi
+
+    # Quick fail with minimal output = likely still rate limited
+    local output_size=$(echo "$probe_output" | wc -c | tr -d ' ')
+    if [ $probe_exit -ne 0 ] && [ "$output_size" -lt 100 ]; then
+        echo -e "${YELLOW}[PROBE] Still rate limited (quick exit).${NC}" >&2
+        return 0
+    fi
+
+    # Got a response but not "OK" - likely recovered
+    if [ $probe_exit -eq 0 ] && [ "$output_size" -gt 50 ]; then
+        echo -e "${GREEN}[PROBE] ✓ Got response - rate limit lifted!${NC}" >&2
+        return 1
+    fi
+
+    echo -e "${YELLOW}[PROBE] Inconclusive, assuming still rate limited.${NC}" >&2
+    return 0
+}
+
 # Format seconds into human-readable wait time
 format_wait_time() {
     local seconds=$1
@@ -685,6 +732,7 @@ run_claude_expect() {
 }
 
 # Wrapper that handles rate limit retries
+# Uses probe-based polling: when rate limited, probe every RATE_LIMIT_PROBE_INTERVAL until Claude is available
 run_claude_with_retry() {
     local prompt="$1"
     local session_id="$2"
@@ -712,35 +760,36 @@ run_claude_with_retry() {
                 return 1
             fi
 
-            # Wait and retry
+            # Probe-based wait: poll until Claude is available
             local retry_msg="$retry_count"
             [ $MAX_RATE_LIMIT_RETRIES -eq 0 ] && retry_msg="$retry_count (infinite mode)"
             [ $MAX_RATE_LIMIT_RETRIES -gt 0 ] && retry_msg="$retry_count / $MAX_RATE_LIMIT_RETRIES"
 
             echo ""
             echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════════╗${NC}"
-            echo -e "${YELLOW}║  ⏳ RATE LIMITED - Waiting before retry                       ║${NC}"
+            echo -e "${YELLOW}║  ⏳ RATE LIMITED - Polling until Claude is available          ║${NC}"
             echo -e "${YELLOW}╠═══════════════════════════════════════════════════════════════╣${NC}"
             echo -e "${YELLOW}║  Retry: $retry_msg${NC}"
-            echo -e "${YELLOW}║  Wait time: $(format_wait_time $RATE_LIMIT_WAIT)${NC}"
-            echo -e "${YELLOW}║  Will resume at: $(date -d "+${RATE_LIMIT_WAIT} seconds" 2>/dev/null || date -v+${RATE_LIMIT_WAIT}S 2>/dev/null || echo "in ${RATE_LIMIT_WAIT}s")${NC}"
+            echo -e "${YELLOW}║  Probe interval: $(format_wait_time $RATE_LIMIT_PROBE_INTERVAL)${NC}"
             echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════════╝${NC}"
             echo ""
 
-            # Send webhook notification
-            send_webhook "⏳ Rate limited on session $session_id. Waiting $(format_wait_time $RATE_LIMIT_WAIT) before retry ($retry_msg)" "Rate Limit"
+            send_webhook "⏳ Rate limited on session $session_id. Polling every $(format_wait_time $RATE_LIMIT_PROBE_INTERVAL) until available ($retry_msg)" "Rate Limit"
 
-            # Wait with countdown (show progress every minute for long waits)
-            local remaining=$RATE_LIMIT_WAIT
-            while [ $remaining -gt 0 ]; do
-                if [ $remaining -gt 60 ] && [ $((remaining % 60)) -eq 0 ]; then
-                    echo -e "${YELLOW}>>> $(format_wait_time $remaining) remaining...${NC}"
+            # Poll with probes until rate limit is lifted
+            local probe_count=0
+            while true; do
+                probe_count=$((probe_count + 1))
+                echo -e "${CYAN}>>> Waiting $(format_wait_time $RATE_LIMIT_PROBE_INTERVAL) before probe #$probe_count...${NC}"
+                sleep $RATE_LIMIT_PROBE_INTERVAL
+
+                if ! probe_rate_limit; then
+                    # Probe succeeded - rate limit lifted
+                    echo -e "${GREEN}>>> Claude is available! Resuming workflow...${NC}"
+                    send_webhook "✅ Rate limit lifted on session $session_id after $probe_count probes. Resuming." "Rate Limit Lifted"
+                    break
                 fi
-                sleep 1
-                remaining=$((remaining - 1))
             done
-
-            echo -e "${GREEN}>>> Resuming after rate limit wait...${NC}"
         else
             # No rate limit, return result
             return $result

@@ -738,12 +738,20 @@ run_claude_with_retry() {
     local session_id="$2"
     local is_resume="$3"
     local retry_count=0
+    local first_call=true
 
     # MAX_RATE_LIMIT_RETRIES=0 means infinite retries
     while [ $MAX_RATE_LIMIT_RETRIES -eq 0 ] || [ $retry_count -lt $MAX_RATE_LIMIT_RETRIES ]; do
         # Use || true to prevent set -e from exiting on non-zero return
         local result=0
         run_claude_expect "$prompt" "$session_id" "$is_resume" || result=$?
+
+        # After first call, always use resume mode (session exists even if rate limited)
+        if [ "$first_call" = true ]; then
+            first_call=false
+            is_resume="true"
+            [ "$DEBUG_MODE" = true ] && echo -e "${YELLOW}[DEBUG] Switching to resume mode for subsequent retries${NC}"
+        fi
 
         if [ "$LAST_RUN_RATE_LIMITED" = true ]; then
             retry_count=$((retry_count + 1))

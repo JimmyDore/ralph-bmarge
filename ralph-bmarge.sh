@@ -22,7 +22,7 @@ MAX_ITERATIONS=0
 MAX_CONTINUES=0
 MAX_STALE_CONTINUES=10  # Safety: abort if status unchanged after N continues
 MAX_RATE_LIMIT_RETRIES=0  # 0 = infinite retries on rate limit (never give up)
-RATE_LIMIT_PROBE_INTERVAL=120  # Probe every N seconds until rate limit lifted (default: 2 min)
+RATE_LIMIT_PROBE_INTERVAL=900  # Probe every N seconds until rate limit lifted (default: 15 min)
 WEBHOOK_URL=""
 NOTIFY_SOUND=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -148,7 +148,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --max-continues N      Limit resume attempts per workflow (default: infinite)"
             echo "  --max-stale N          Abort if status unchanged after N continues (default: 10)"
             echo "  --max-rate-retries N   Max rate limit retries (0 = infinite, default: 0)"
-            echo "  --probe-interval N     Probe every N seconds until rate limit lifted (default: 120 = 2 min)"
+            echo "  --probe-interval N     Probe every N seconds until rate limit lifted (default: 900 = 15 min)"
             echo "  --webhook URL          Send notifications to Slack/Discord webhook"
             echo "  --notify-sound         Play sound when sprint completes (macOS)"
             echo "  --test-claude          Test Claude execution (diagnose prompt handling)"
